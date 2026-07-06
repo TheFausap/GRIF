@@ -1,0 +1,17 @@
+# configs/model_config.yaml
+model:
+  d_model: 768
+  n_layers: 18
+  n_heads: 12
+  d_rnn: 1024        # ~4/3 * d_model
+  vocab_size: 50000
+  seq_len: 1024
+
+  layer_pattern: ["recurrent", "recurrent", "attention"]
+
+  attention_window: 512
+
+memory:
+  enabled: true
+  top_k: 8
+  chunk_size: 256
