@@ -13,7 +13,6 @@ from configs.griffin import GriffinConfig
 from data.dataset import StreamingTokenChunkDataset, iter_dataset_texts, resolve_valid_split
 from inference.generation import generate_text
 from models.griffin_lm import GriffinLM
-from tokenization import tokeniz
 from tokenization.tokeniz import SimpleTokenizer, load_tokenizer, train_bpe_tokenizer
 import torch
 import torch.nn as nn
@@ -57,7 +56,7 @@ def build_lr_scheduler(optimizer, cfg: GriffinConfig):
 # Train / eval / generate
 # -----------------------------
 
-def evaluate(model, loader, device, dtype, max_batches: int = 40):
+def evaluate(model, loader, tokenizer: SimpleTokenizer, device, dtype, max_batches: int = 40):
     model.eval()
     losses = []
     with torch.no_grad():
@@ -69,7 +68,7 @@ def evaluate(model, loader, device, dtype, max_batches: int = 40):
             with maybe_autocast(device, dtype):
                 _, loss = model(x, y)
             losses.append(loss.item())
-        sample = generate_text(model, tokeniz, "Once upon a time,", device)
+        sample = generate_text(model, tokenizer, "Once upon a time,", device)
         print("\n[SAMPLE]\n", sample[:200], "\n")
     model.train()
     mean_loss = float(sum(losses) / max(1, len(losses)))
@@ -190,7 +189,7 @@ def train(cfg: GriffinConfig):
             t0 = time.time()
 
         if (step + 1) % cfg.eval_interval == 0:
-            val_loss, val_ppl = evaluate(model, valid_loader, device, dtype, max_batches=cfg.eval_batches)
+            val_loss, val_ppl = evaluate(model, valid_loader, tokenizer, device, dtype, max_batches=cfg.eval_batches)
             print(json.dumps({
                 "step": step + 1,
                 "val_loss": round(val_loss, 4),
@@ -209,4 +208,3 @@ def train(cfg: GriffinConfig):
 
     save_checkpoint(outdir / "checkpoint_final.pt", model, optimizer, scheduler, cfg.max_steps, cfg, best_val)
     print(f"[done] final checkpoint -> {outdir / 'checkpoint_final.pt'}")
-
