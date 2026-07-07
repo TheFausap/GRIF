@@ -3,6 +3,7 @@
 # Optimizer / schedule
 # -----------------------------
 
+import copy
 from dataclasses import asdict
 import json
 import math
@@ -51,22 +52,33 @@ def build_lr_scheduler(optimizer, cfg: GriffinConfig):
         return 0.5 * (1.0 + math.cos(math.pi * progress))
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-def run_lr_finder(model, optimizer, train_loader, device, cfg):
+def _clone_model_state_for_restore(model: nn.Module):
+    return {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+
+
+def run_lr_finder(model, optimizer, train_loader, device, dtype, cfg):
     import math
 
     print("🔍 Running LR range test...")
 
+    was_training = model.training
+    model_state = _clone_model_state_for_restore(model)
+    optimizer_state = copy.deepcopy(optimizer.state_dict())
     model.train()
 
     start_lr = cfg.lr_finder_start
     end_lr = cfg.lr_finder_end
     num_steps = cfg.lr_finder_steps
+    if start_lr <= 0 or end_lr <= start_lr:
+        raise ValueError("LR finder requires 0 < lr_finder_start < lr_finder_end")
+    if num_steps < 2:
+        raise ValueError("LR finder requires lr_finder_steps >= 2")
 
-    gamma = (end_lr / start_lr) ** (1 / num_steps)
+    gamma = (end_lr / start_lr) ** (1 / (num_steps - 1))
     lr = start_lr
 
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        param_group["lr"] = lr
 
     lrs = []
     losses = []
@@ -74,73 +86,102 @@ def run_lr_finder(model, optimizer, train_loader, device, cfg):
     avg_loss = 0.0
     beta = 0.98  # smoothing
 
-    step = 0
+    try:
+        for step, batch in enumerate(train_loader):
+            if step >= num_steps:
+                break
 
-    for batch in train_loader:
-        if step >= num_steps:
-            break
-
-        if isinstance(batch, dict):
+            if isinstance(batch, dict):
                 inputs = batch["input_ids"].to(device)
                 targets = batch["labels"].to(device)
-        elif isinstance(batch, (list, tuple)):
+            elif isinstance(batch, (list, tuple)):
                 inputs = batch[0].to(device)
                 targets = batch[1].to(device)
-        else:
+            else:
                 raise TypeError(f"Unsupported batch type: {type(batch)}")
 
-        optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
-        loss = model(inputs, labels=targets)[1]
-        loss.backward()
-        optimizer.step()
+            with maybe_autocast(device, dtype):
+                loss = model(inputs, labels=targets)[1]
+            raw_loss = loss.item()
+            if not math.isfinite(raw_loss):
+                print("⚠️ Loss became non-finite, stopping LR test")
+                break
 
-        # EMA smoothing
-        avg_loss = beta * avg_loss + (1 - beta) * loss.item()
-        smoothed_loss = avg_loss / (1 - beta ** (step + 1))
+            loss.backward()
+            optimizer.step()
 
-        lrs.append(lr)
-        losses.append(smoothed_loss)
+            # EMA smoothing
+            avg_loss = beta * avg_loss + (1 - beta) * raw_loss
+            smoothed_loss = avg_loss / (1 - beta ** (step + 1))
 
-        # update LR exponentially
-        lr *= gamma
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+            lrs.append(lr)
+            losses.append(smoothed_loss)
 
-        # stop early if exploding
-        if step > 50 and smoothed_loss > 4 * min(losses):
-            print("⚠️ Loss diverged early, stopping LR test")
-            break
+            # update LR exponentially
+            lr *= gamma
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
-        step += 1
+            # stop early if exploding
+            if step > 50 and smoothed_loss > 4 * min(losses):
+                print("⚠️ Loss diverged early, stopping LR test")
+                break
+    finally:
+        model.load_state_dict(model_state)
+        optimizer.load_state_dict(optimizer_state)
+        optimizer.zero_grad(set_to_none=True)
+        model.train(was_training)
 
-    print("✅ LR finder done")
+    print("✅ LR finder done; model and optimizer state restored")
     return lrs, losses
 
 def analyze_lr_curve(lrs, losses):
     import numpy as np
 
-    losses = np.array(losses)
-    lrs = np.array(lrs)
+    lrs = np.array(lrs, dtype=float)
+    losses = np.array(losses, dtype=float)
+    finite = np.isfinite(lrs) & np.isfinite(losses) & (lrs > 0)
+    lrs = lrs[finite]
+    losses = losses[finite]
+    if len(lrs) < 3:
+        raise RuntimeError("LR finder did not collect enough finite points to analyze")
 
-    min_loss_idx = losses.argmin()
+    # work in log-lr space
+    log_lrs = np.log10(lrs)
 
-    # find divergence point
-    for i in range(len(losses)):
-        if losses[i] > 4 * losses[min_loss_idx]:
+    warmup_skip = min(max(3, len(lrs) // 20), max(0, len(lrs) - 3))
+    div_idx = len(losses)
+    best_so_far = float("inf")
+    for i, loss in enumerate(losses):
+        best_so_far = min(best_so_far, loss)
+        if i > warmup_skip and loss > 4 * best_so_far:
             div_idx = i
             break
+
+    usable_end = max(warmup_skip + 3, div_idx)
+    usable_end = min(usable_end, len(lrs))
+    window = min(9, usable_end)
+    if window >= 3:
+        kernel = np.ones(window) / window
+        padded = np.pad(losses[:usable_end], (window // 2, window - 1 - window // 2), mode="edge")
+        curve_losses = np.convolve(padded, kernel, mode="valid")
     else:
-        div_idx = len(losses) - 1
+        curve_losses = losses[:usable_end]
 
-    lr_min_loss = lrs[min_loss_idx]
-    lr_diverge = lrs[div_idx]
-    suggested_lr = lr_diverge / 10
+    # Steepest descent before divergence, skipping the noisiest first few points.
+    grads = np.gradient(curve_losses, log_lrs[:usable_end])
+    idx = warmup_skip + int(np.argmin(grads[warmup_skip:usable_end]))
 
-    print(f"\n📊 LR FINDER RESULTS")
-    print(f"Min loss LR: {lr_min_loss:.2e}")
-    print(f"Divergence LR: {lr_diverge:.2e}")
-    print(f"✅ Suggested LR: {suggested_lr:.2e}\n")
+    suggested_lr = lrs[idx]
+    min_idx = int(np.argmin(losses[:usable_end]))
+
+    print("\n📊 LR FINDER RESULTS")
+    print(f"Steepest descent LR: {suggested_lr:.2e}")
+    print(f"Min loss LR: {lrs[min_idx]:.2e}")
+    if div_idx < len(losses):
+        print(f"Divergence LR: {lrs[div_idx]:.2e}")
 
     return suggested_lr
 
@@ -156,6 +197,7 @@ def plot_lr_finder(lrs, losses, save_path="lr_finder.png"):
     plt.grid()
 
     plt.savefig(save_path)
+    plt.close()
     print(f"📈 Saved LR curve to {save_path}")
 
 # -----------------------------
@@ -239,12 +281,16 @@ def train(cfg: GriffinConfig):
 
     # ---- LR FINDER HOOK ----
     if getattr(cfg, "lr_finder", False):
-        lrs, losses = run_lr_finder(model, optimizer, train_loader, device, cfg)
+        lrs, losses = run_lr_finder(model, optimizer, train_loader, device, dtype, cfg)
 
         suggested_lr = analyze_lr_curve(lrs, losses)
-        plot_lr_finder(lrs, losses)
+        plot_lr_finder(lrs, losses, outdir / "lr_finder.png")
 
         print(f"💡 Updating LR from {cfg.lr} → {suggested_lr}")
+        print(
+            f"[lr] scheduler warms up to this LR over {cfg.warmup_steps} optimizer updates "
+            f"({cfg.warmup_steps * cfg.grad_accum_steps} micro-batches with grad_accum_steps={cfg.grad_accum_steps})"
+        )
 
         cfg.lr = suggested_lr
 
@@ -267,6 +313,7 @@ def train(cfg: GriffinConfig):
     model.train()
     running_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
+    optimizer_updates = getattr(scheduler, "last_epoch", 0)
 
     t0 = time.time()
     train_iter = iter(train_loader)
@@ -292,6 +339,7 @@ def train(cfg: GriffinConfig):
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
+            optimizer_updates += 1
 
         if (step + 1) % cfg.log_interval == 0:
             dt = time.time() - t0
@@ -302,6 +350,7 @@ def train(cfg: GriffinConfig):
             lr = scheduler.get_last_lr()[0]
             print(json.dumps({
                 "step": step + 1,
+                "optimizer_updates": optimizer_updates,
                 "loss": round(cur_loss, 4),
                 "ppl": round(cur_ppl, 3) if math.isfinite(cur_ppl) else "inf",
                 "lr": lr,
