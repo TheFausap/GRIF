@@ -29,9 +29,22 @@ def resolve_valid_split(dataset_name: str, requested: str = "validation") -> str
         pass
     return requested
 
-def iter_dataset_texts(dataset_name: str, split: str, text_field: str = "text", streaming: bool = True, limit: Optional[int] = None) -> Iterator[str]:
+def iter_dataset_texts(
+    dataset_name: str,
+    split: str,
+    text_field: str = "text",
+    streaming: bool = True,
+    limit: Optional[int] = None,
+    shuffle_buffer: int = 0,
+    seed: int = 42,
+) -> Iterator[str]:
     load_dataset, _ = _import_datasets()
     ds = load_dataset(dataset_name, split=split, streaming=streaming)
+    if shuffle_buffer > 0:
+        if streaming:
+            ds = ds.shuffle(buffer_size=shuffle_buffer, seed=seed)
+        else:
+            ds = ds.shuffle(seed=seed)
     n = 0
     for ex in ds:
         if text_field not in ex:
@@ -54,6 +67,8 @@ class StreamingTokenChunkDataset(IterableDataset):
         streaming: bool = True,
         max_docs: Optional[int] = None,
         skip_chunks: int = 0,
+        shuffle_buffer: int = 0,
+        seed: int = 42,
     ):
         super().__init__()
         self.dataset_name = dataset_name
@@ -64,11 +79,21 @@ class StreamingTokenChunkDataset(IterableDataset):
         self.streaming = streaming
         self.max_docs = max_docs
         self.skip_chunks = max(0, skip_chunks)
+        self.shuffle_buffer = max(0, shuffle_buffer)
+        self.seed = seed
 
     def __iter__(self):
         buffer = []
         skipped = 0
-        for text in iter_dataset_texts(self.dataset_name, self.split, self.text_field, self.streaming, self.max_docs):
+        for text in iter_dataset_texts(
+            self.dataset_name,
+            self.split,
+            self.text_field,
+            self.streaming,
+            self.max_docs,
+            self.shuffle_buffer,
+            self.seed,
+        ):
             ids = self.tokenizer.encode(text, add_bos=False, add_eos=True)
             buffer.extend(ids)
             while len(buffer) >= self.seq_len + 1:

@@ -83,6 +83,7 @@ def parse_args():
     parser.add_argument("--text_field", type=str, default=GriffinConfig.text_field)
     parser.add_argument("--streaming", action="store_true", default=GriffinConfig.streaming)
     parser.add_argument("--no_streaming", dest="streaming", action="store_false")
+    parser.add_argument("--shuffle_buffer", type=int, default=GriffinConfig.shuffle_buffer)
     parser.add_argument("--tokenizer_path", type=str, default=GriffinConfig.tokenizer_path)
     parser.add_argument("--train_tokenizer", action="store_true")
     parser.add_argument("--tokenizer_train_docs", type=int, default=GriffinConfig.tokenizer_train_docs)

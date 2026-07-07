@@ -10,6 +10,7 @@ class GriffinConfig:
     valid_split: str = "validation"
     text_field: str = "text"
     streaming: bool = True
+    shuffle_buffer: int = 10000
 
     # Tokenizer
     tokenizer_path: str = "tokenizer.json"

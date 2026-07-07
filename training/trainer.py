@@ -237,12 +237,17 @@ def evaluate(model, loader, tokenizer: SimpleTokenizer, device, dtype, max_batch
     model.train()
     mean_loss = float(sum(losses) / max(1, len(losses)))
     ppl = math.exp(mean_loss) if mean_loss < 20 else float("inf")
-    return mean_loss, ppl
+    stats = {
+        "val_batches": len(losses),
+        "val_loss_min": min(losses) if losses else float("nan"),
+        "val_loss_max": max(losses) if losses else float("nan"),
+    }
+    return mean_loss, ppl, stats
 
 def make_dataloaders(cfg: GriffinConfig, tokenizer: SimpleTokenizer, train_skip_chunks: int = 0):
     train_ds = StreamingTokenChunkDataset(
         cfg.dataset, cfg.train_split, tokenizer, cfg.seq_len, cfg.text_field, cfg.streaming,
-        skip_chunks=train_skip_chunks,
+        skip_chunks=train_skip_chunks, shuffle_buffer=cfg.shuffle_buffer, seed=cfg.seed,
     )
     valid_split = resolve_valid_split(cfg.dataset, cfg.valid_split)
     valid_ds = StreamingTokenChunkDataset(
@@ -289,6 +294,10 @@ def train(cfg: GriffinConfig):
     save_json(outdir / "resolved_config.json", asdict(cfg))
 
     train_loader, valid_loader = make_dataloaders(cfg, tokenizer)
+    if cfg.shuffle_buffer > 0:
+        print(f"[data] train stream shuffle_buffer={cfg.shuffle_buffer:,} seed={cfg.seed}")
+    else:
+        print("[data] train stream shuffle disabled")
 
     model = GriffinLM(cfg).to(device)
     if cfg.compile and hasattr(torch, "compile") and device.type != "mps":
@@ -330,19 +339,25 @@ def train(cfg: GriffinConfig):
             print(f"[resume] checkpoint_current_val={float(ckpt['current_val_loss']):.4f}")
         train_skip_chunks = start_step * cfg.batch_size
         train_loader, valid_loader = make_dataloaders(cfg, tokenizer, train_skip_chunks=train_skip_chunks)
-        print(f"[resume] skipping {train_skip_chunks:,} training chunks to align the streaming loader")
+        print(f"[resume] advancing training stream by {train_skip_chunks:,} chunks")
         if cfg.eval_on_resume:
-            val_loss, val_ppl = evaluate(model, valid_loader, tokenizer, device, dtype, max_batches=cfg.eval_batches)
+            val_loss, val_ppl, val_stats = evaluate(model, valid_loader, tokenizer, device, dtype, max_batches=cfg.eval_batches)
             print(json.dumps({
                 "step": start_step,
                 "resume_val_loss": round(val_loss, 4),
                 "resume_val_ppl": round(val_ppl, 3) if math.isfinite(val_ppl) else "inf",
+                "val_loss_min": round(val_stats["val_loss_min"], 4),
+                "val_loss_max": round(val_stats["val_loss_max"], 4),
+                "val_batches": val_stats["val_batches"],
             }))
 
     print(f"[model] params={count_parameters(model):,}")
 
     model.train()
     running_loss = 0.0
+    log_loss_min = float("inf")
+    log_loss_max = -float("inf")
+    last_grad_norm = None
     optimizer.zero_grad(set_to_none=True)
     optimizer_updates = getattr(scheduler, "last_epoch", 0)
 
@@ -363,10 +378,14 @@ def train(cfg: GriffinConfig):
             loss = loss / cfg.grad_accum_steps
 
         loss.backward()
-        running_loss += loss.item() * cfg.grad_accum_steps
+        raw_loss = loss.item() * cfg.grad_accum_steps
+        running_loss += raw_loss
+        log_loss_min = min(log_loss_min, raw_loss)
+        log_loss_max = max(log_loss_max, raw_loss)
 
         if (step + 1) % cfg.grad_accum_steps == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+            last_grad_norm = float(grad_norm.detach().cpu().item() if torch.is_tensor(grad_norm) else grad_norm)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
@@ -383,19 +402,27 @@ def train(cfg: GriffinConfig):
                 "step": step + 1,
                 "optimizer_updates": optimizer_updates,
                 "loss": round(cur_loss, 4),
+                "loss_min": round(log_loss_min, 4),
+                "loss_max": round(log_loss_max, 4),
                 "ppl": round(cur_ppl, 3) if math.isfinite(cur_ppl) else "inf",
                 "lr": lr,
+                "grad_norm": round(last_grad_norm, 4) if last_grad_norm is not None else None,
                 "tok/s": round(toks_per_s, 1),
             }))
             running_loss = 0.0
+            log_loss_min = float("inf")
+            log_loss_max = -float("inf")
             t0 = time.time()
 
         if (step + 1) % cfg.eval_interval == 0:
-            val_loss, val_ppl = evaluate(model, valid_loader, tokenizer, device, dtype, max_batches=cfg.eval_batches)
+            val_loss, val_ppl, val_stats = evaluate(model, valid_loader, tokenizer, device, dtype, max_batches=cfg.eval_batches)
             print(json.dumps({
                 "step": step + 1,
                 "val_loss": round(val_loss, 4),
                 "val_ppl": round(val_ppl, 3) if math.isfinite(val_ppl) else "inf",
+                "val_loss_min": round(val_stats["val_loss_min"], 4),
+                "val_loss_max": round(val_stats["val_loss_max"], 4),
+                "val_batches": val_stats["val_batches"],
             }))
             improved = val_loss < best_val
             if improved:
