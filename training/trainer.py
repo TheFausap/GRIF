@@ -239,9 +239,10 @@ def evaluate(model, loader, tokenizer: SimpleTokenizer, device, dtype, max_batch
     ppl = math.exp(mean_loss) if mean_loss < 20 else float("inf")
     return mean_loss, ppl
 
-def make_dataloaders(cfg: GriffinConfig, tokenizer: SimpleTokenizer):
+def make_dataloaders(cfg: GriffinConfig, tokenizer: SimpleTokenizer, train_skip_chunks: int = 0):
     train_ds = StreamingTokenChunkDataset(
-        cfg.dataset, cfg.train_split, tokenizer, cfg.seq_len, cfg.text_field, cfg.streaming
+        cfg.dataset, cfg.train_split, tokenizer, cfg.seq_len, cfg.text_field, cfg.streaming,
+        skip_chunks=train_skip_chunks,
     )
     valid_split = resolve_valid_split(cfg.dataset, cfg.valid_split)
     valid_ds = StreamingTokenChunkDataset(
@@ -325,6 +326,9 @@ def train(cfg: GriffinConfig):
         start_step = int(ckpt.get("step", 0))
         best_val = float(ckpt.get("best_val_loss", float("inf")))
         print(f"[resume] loaded step={start_step} best_val={best_val:.4f}")
+        train_skip_chunks = start_step * cfg.batch_size
+        train_loader, valid_loader = make_dataloaders(cfg, tokenizer, train_skip_chunks=train_skip_chunks)
+        print(f"[resume] skipping {train_skip_chunks:,} training chunks to align the streaming loader")
 
     print(f"[model] params={count_parameters(model):,}")
 

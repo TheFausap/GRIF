@@ -44,8 +44,17 @@ def iter_dataset_texts(dataset_name: str, split: str, text_field: str = "text", 
                 break
 
 class StreamingTokenChunkDataset(IterableDataset):
-    def __init__(self, dataset_name: str, split: str, tokenizer: SimpleTokenizer, seq_len: int, text_field: str = "text",
-                 streaming: bool = True, max_docs: Optional[int] = None):
+    def __init__(
+        self,
+        dataset_name: str,
+        split: str,
+        tokenizer: SimpleTokenizer,
+        seq_len: int,
+        text_field: str = "text",
+        streaming: bool = True,
+        max_docs: Optional[int] = None,
+        skip_chunks: int = 0,
+    ):
         super().__init__()
         self.dataset_name = dataset_name
         self.split = split
@@ -54,15 +63,20 @@ class StreamingTokenChunkDataset(IterableDataset):
         self.text_field = text_field
         self.streaming = streaming
         self.max_docs = max_docs
+        self.skip_chunks = max(0, skip_chunks)
 
     def __iter__(self):
         buffer = []
+        skipped = 0
         for text in iter_dataset_texts(self.dataset_name, self.split, self.text_field, self.streaming, self.max_docs):
             ids = self.tokenizer.encode(text, add_bos=False, add_eos=True)
             buffer.extend(ids)
             while len(buffer) >= self.seq_len + 1:
                 chunk = buffer[: self.seq_len + 1]
                 buffer = buffer[self.seq_len + 1 :]
+                if skipped < self.skip_chunks:
+                    skipped += 1
+                    continue
                 x = torch.tensor(chunk[:-1], dtype=torch.long)
                 y = torch.tensor(chunk[1:], dtype=torch.long)
                 yield x, y

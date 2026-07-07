@@ -63,7 +63,7 @@ def save_checkpoint(path: Path, model, optimizer, scheduler, step, cfg: GriffinC
     torch.save(payload, path)
 
 def load_checkpoint(path: str, model, optimizer=None, scheduler=None, map_location="cpu"):
-    ckpt = torch.load(path, map_location=map_location)
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
     model.load_state_dict(ckpt["model"])
     if optimizer is not None and ckpt.get("optimizer") is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
