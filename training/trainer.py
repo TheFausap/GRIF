@@ -47,6 +47,25 @@ def total_optimizer_steps(cfg: GriffinConfig):
     return max(1, cfg.max_steps // max(1, cfg.grad_accum_steps))
 
 
+def resolve_max_steps_from_tokens(cfg: GriffinConfig):
+    if cfg.max_tokens is None:
+        return
+    if cfg.max_tokens <= 0:
+        raise ValueError("max_tokens must be positive when provided")
+    tokens_per_micro_step = cfg.batch_size * cfg.seq_len
+    if tokens_per_micro_step <= 0:
+        raise ValueError("batch_size * seq_len must be positive")
+    cfg.max_steps = math.ceil(cfg.max_tokens / tokens_per_micro_step)
+
+
+def planned_train_tokens(cfg: GriffinConfig):
+    return cfg.max_steps * cfg.batch_size * cfg.seq_len
+
+
+def tokens_at_step(cfg: GriffinConfig, step: int):
+    return step * cfg.batch_size * cfg.seq_len
+
+
 def build_lr_scheduler(optimizer, cfg: GriffinConfig):
     total_steps = total_optimizer_steps(cfg)
 
@@ -278,6 +297,7 @@ def maybe_train_tokenizer(cfg: GriffinConfig) -> SimpleTokenizer:
 
 def train(cfg: GriffinConfig):
     set_seed(cfg.seed)
+    resolve_max_steps_from_tokens(cfg)
     outdir = Path(cfg.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
     save_json(outdir / "config.json", asdict(cfg))
@@ -288,6 +308,13 @@ def train(cfg: GriffinConfig):
     print(f"[device] using {device} dtype={dtype}")
     if device.type == "mps":
         print("[device] MPS backend detected. For first stable runs, keep dtype=float32 and num_workers=0.")
+    print(
+        f"[train] max_steps={cfg.max_steps:,} micro-batches, "
+        f"planned_tokens={planned_train_tokens(cfg):,}, "
+        f"optimizer_updates={total_optimizer_steps(cfg):,}"
+    )
+    if cfg.max_tokens is not None and planned_train_tokens(cfg) != cfg.max_tokens:
+        print(f"[train] max_tokens={cfg.max_tokens:,} rounded up to {planned_train_tokens(cfg):,} tokens")
 
     tokenizer = maybe_train_tokenizer(cfg)
     cfg.vocab_size = len(tokenizer.vocab)  # align model vocab with trained tokenizer
@@ -330,20 +357,31 @@ def train(cfg: GriffinConfig):
     start_step = 0
     best_val = float("inf")
     if cfg.resume:
-        ckpt = load_checkpoint(cfg.resume, model, optimizer, scheduler, map_location=device)
-        sync_optimizer_lr_from_scheduler(optimizer, scheduler)
-        start_step = int(ckpt.get("step", 0))
-        best_val = float(ckpt.get("best_val_loss", float("inf")))
-        print(f"[resume] loaded step={start_step} best_val={best_val:.4f}")
+        if cfg.finetune_reset:
+            ckpt = load_checkpoint(cfg.resume, model, map_location=device)
+            print(f"[finetune] loaded model weights from {cfg.resume}")
+            print("[finetune] optimizer, scheduler, step counter, and training stream reset")
+        else:
+            ckpt = load_checkpoint(cfg.resume, model, optimizer, scheduler, map_location=device)
+            sync_optimizer_lr_from_scheduler(optimizer, scheduler)
+            start_step = int(ckpt.get("step", 0))
+            best_val = float(ckpt.get("best_val_loss", float("inf")))
+            print(f"[resume] loaded step={start_step} best_val={best_val:.4f}")
+            if start_step >= cfg.max_steps:
+                print(f"[resume] start_step={start_step:,} is at or beyond max_steps={cfg.max_steps:,}; no more training steps remain")
         if ckpt.get("current_val_loss") is not None:
-            print(f"[resume] checkpoint_current_val={float(ckpt['current_val_loss']):.4f}")
-        train_skip_chunks = start_step * cfg.batch_size
-        train_loader, valid_loader = make_dataloaders(cfg, tokenizer, train_skip_chunks=train_skip_chunks)
-        print(f"[resume] advancing training stream by {train_skip_chunks:,} chunks")
+            print(f"[checkpoint] current_val={float(ckpt['current_val_loss']):.4f}")
+        if not cfg.finetune_reset:
+            train_skip_chunks = start_step * cfg.batch_size
+            train_loader, valid_loader = make_dataloaders(cfg, tokenizer, train_skip_chunks=train_skip_chunks)
+            print(f"[resume] advancing training stream by {train_skip_chunks:,} chunks")
         if cfg.eval_on_resume:
             val_loss, val_ppl, val_stats = evaluate(model, valid_loader, tokenizer, device, dtype, max_batches=cfg.eval_batches)
+            if cfg.finetune_reset:
+                best_val = val_loss
             print(json.dumps({
                 "step": start_step,
+                "tokens": tokens_at_step(cfg, start_step),
                 "resume_val_loss": round(val_loss, 4),
                 "resume_val_ppl": round(val_ppl, 3) if math.isfinite(val_ppl) else "inf",
                 "val_loss_min": round(val_stats["val_loss_min"], 4),
@@ -400,6 +438,7 @@ def train(cfg: GriffinConfig):
             lr = scheduler.get_last_lr()[0]
             print(json.dumps({
                 "step": step + 1,
+                "tokens": tokens_at_step(cfg, step + 1),
                 "optimizer_updates": optimizer_updates,
                 "loss": round(cur_loss, 4),
                 "loss_min": round(log_loss_min, 4),
@@ -418,6 +457,7 @@ def train(cfg: GriffinConfig):
             val_loss, val_ppl, val_stats = evaluate(model, valid_loader, tokenizer, device, dtype, max_batches=cfg.eval_batches)
             print(json.dumps({
                 "step": step + 1,
+                "tokens": tokens_at_step(cfg, step + 1),
                 "val_loss": round(val_loss, 4),
                 "val_ppl": round(val_ppl, 3) if math.isfinite(val_ppl) else "inf",
                 "val_loss_min": round(val_stats["val_loss_min"], 4),

@@ -37,6 +37,7 @@ class GriffinConfig:
     batch_size: int = 4
     grad_accum_steps: int = 8
     max_steps: int = 3000
+    max_tokens: Optional[int] = None
     lr: float = 3e-4
     lr_finder: bool = True
     lr_finder_steps: int = 800
@@ -56,6 +57,7 @@ class GriffinConfig:
     output_dir: str = "runs/griffin_tinystories_small"
     resume: Optional[str] = None
     eval_on_resume: bool = False
+    finetune_reset: bool = False
     device: str = "auto"  # auto|cpu|mps|cuda
     dtype: str = "float32"  # float32|float16|bfloat16
     compile: bool = False
