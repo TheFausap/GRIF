@@ -43,14 +43,30 @@ def build_optimizer(model: nn.Module, cfg: GriffinConfig):
     ]
     return torch.optim.AdamW(param_groups, lr=cfg.lr, betas=(0.9, 0.95))
 
+def total_optimizer_steps(cfg: GriffinConfig):
+    return max(1, cfg.max_steps // max(1, cfg.grad_accum_steps))
+
+
 def build_lr_scheduler(optimizer, cfg: GriffinConfig):
+    total_steps = total_optimizer_steps(cfg)
+
     def lr_lambda(step):
         if step < cfg.warmup_steps:
             return float(step + 1) / float(max(1, cfg.warmup_steps))
-        progress = (step - cfg.warmup_steps) / float(max(1, cfg.max_steps - cfg.warmup_steps))
+        progress = (step - cfg.warmup_steps) / float(max(1, total_steps - cfg.warmup_steps))
         progress = min(max(progress, 0.0), 1.0)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def sync_optimizer_lr_from_scheduler(optimizer, scheduler):
+    lrs = [
+        base_lr * lr_lambda(scheduler.last_epoch)
+        for base_lr, lr_lambda in zip(scheduler.base_lrs, scheduler.lr_lambdas)
+    ]
+    for param_group, lr in zip(optimizer.param_groups, lrs):
+        param_group["lr"] = lr
+    scheduler._last_lr = lrs
 
 def _clone_model_state_for_restore(model: nn.Module):
     return {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
@@ -289,7 +305,8 @@ def train(cfg: GriffinConfig):
         print(f"💡 Updating LR from {cfg.lr} → {suggested_lr}")
         print(
             f"[lr] scheduler warms up to this LR over {cfg.warmup_steps} optimizer updates "
-            f"({cfg.warmup_steps * cfg.grad_accum_steps} micro-batches with grad_accum_steps={cfg.grad_accum_steps})"
+            f"({cfg.warmup_steps * cfg.grad_accum_steps} micro-batches with grad_accum_steps={cfg.grad_accum_steps}) "
+            f"and decays over {total_optimizer_steps(cfg)} optimizer updates"
         )
 
         cfg.lr = suggested_lr
@@ -304,6 +321,7 @@ def train(cfg: GriffinConfig):
     best_val = float("inf")
     if cfg.resume:
         ckpt = load_checkpoint(cfg.resume, model, optimizer, scheduler, map_location=device)
+        sync_optimizer_lr_from_scheduler(optimizer, scheduler)
         start_step = int(ckpt.get("step", 0))
         best_val = float(ckpt.get("best_val_loss", float("inf")))
         print(f"[resume] loaded step={start_step} best_val={best_val:.4f}")
