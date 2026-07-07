@@ -48,9 +48,115 @@ def build_lr_scheduler(optimizer, cfg: GriffinConfig):
             return float(step + 1) / float(max(1, cfg.warmup_steps))
         progress = (step - cfg.warmup_steps) / float(max(1, cfg.max_steps - cfg.warmup_steps))
         progress = min(max(progress, 0.0), 1.0)
-        return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+def run_lr_finder(model, optimizer, train_loader, device, cfg):
+    import math
+
+    print("🔍 Running LR range test...")
+
+    model.train()
+
+    start_lr = cfg.lr_finder_start
+    end_lr = cfg.lr_finder_end
+    num_steps = cfg.lr_finder_steps
+
+    gamma = (end_lr / start_lr) ** (1 / num_steps)
+    lr = start_lr
+
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+    lrs = []
+    losses = []
+
+    avg_loss = 0.0
+    beta = 0.98  # smoothing
+
+    step = 0
+
+    for batch in train_loader:
+        if step >= num_steps:
+            break
+
+        if isinstance(batch, dict):
+                inputs = batch["input_ids"].to(device)
+                targets = batch["labels"].to(device)
+        elif isinstance(batch, (list, tuple)):
+                inputs = batch[0].to(device)
+                targets = batch[1].to(device)
+        else:
+                raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+        optimizer.zero_grad()
+
+        loss = model(inputs, labels=targets)[1]
+        loss.backward()
+        optimizer.step()
+
+        # EMA smoothing
+        avg_loss = beta * avg_loss + (1 - beta) * loss.item()
+        smoothed_loss = avg_loss / (1 - beta ** (step + 1))
+
+        lrs.append(lr)
+        losses.append(smoothed_loss)
+
+        # update LR exponentially
+        lr *= gamma
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+        # stop early if exploding
+        if step > 50 and smoothed_loss > 4 * min(losses):
+            print("⚠️ Loss diverged early, stopping LR test")
+            break
+
+        step += 1
+
+    print("✅ LR finder done")
+    return lrs, losses
+
+def analyze_lr_curve(lrs, losses):
+    import numpy as np
+
+    losses = np.array(losses)
+    lrs = np.array(lrs)
+
+    min_loss_idx = losses.argmin()
+
+    # find divergence point
+    for i in range(len(losses)):
+        if losses[i] > 4 * losses[min_loss_idx]:
+            div_idx = i
+            break
+    else:
+        div_idx = len(losses) - 1
+
+    lr_min_loss = lrs[min_loss_idx]
+    lr_diverge = lrs[div_idx]
+    suggested_lr = lr_diverge / 10
+
+    print(f"\n📊 LR FINDER RESULTS")
+    print(f"Min loss LR: {lr_min_loss:.2e}")
+    print(f"Divergence LR: {lr_diverge:.2e}")
+    print(f"✅ Suggested LR: {suggested_lr:.2e}\n")
+
+    return suggested_lr
+
+def plot_lr_finder(lrs, losses, save_path="lr_finder.png"):
+    import matplotlib.pyplot as plt
+
+    plt.figure()
+    plt.plot(lrs, losses)
+    plt.xscale("log")
+    plt.xlabel("Learning Rate")
+    plt.ylabel("Loss")
+    plt.title("LR Finder")
+    plt.grid()
+
+    plt.savefig(save_path)
+    print(f"📈 Saved LR curve to {save_path}")
 
 # -----------------------------
 # Train / eval / generate
@@ -68,7 +174,7 @@ def evaluate(model, loader, tokenizer: SimpleTokenizer, device, dtype, max_batch
             with maybe_autocast(device, dtype):
                 _, loss = model(x, y)
             losses.append(loss.item())
-        sample = generate_text(model, tokenizer, "Once upon a time,", device)
+        sample = generate_text(model, tokenizer, "The future of AI ", device)
         print("\n[SAMPLE]\n", sample[:200], "\n")
     model.train()
     mean_loss = float(sum(losses) / max(1, len(losses)))
@@ -130,7 +236,23 @@ def train(cfg: GriffinConfig):
         model = torch.compile(model)
 
     optimizer = build_optimizer(model, cfg)
-    scheduler = build_lr_scheduler(optimizer, cfg)
+
+    # ---- LR FINDER HOOK ----
+    if getattr(cfg, "lr_finder", False):
+        lrs, losses = run_lr_finder(model, optimizer, train_loader, device, cfg)
+
+        suggested_lr = analyze_lr_curve(lrs, losses)
+        plot_lr_finder(lrs, losses)
+
+        print(f"💡 Updating LR from {cfg.lr} → {suggested_lr}")
+
+        cfg.lr = suggested_lr
+
+        # reinitialize optimizer + scheduler ⚠️ IMPORTANT
+        optimizer = build_optimizer(model, cfg)
+        scheduler = build_lr_scheduler(optimizer, cfg)
+    else:
+        scheduler = build_lr_scheduler(optimizer, cfg)
 
     start_step = 0
     best_val = float("inf")

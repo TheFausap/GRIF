@@ -115,6 +115,10 @@ def parse_args():
     parser.add_argument("--eval_batches", type=int, default=GriffinConfig.eval_batches)
     parser.add_argument("--save_interval", type=int, default=GriffinConfig.save_interval)
     parser.add_argument("--num_workers", type=int, default=GriffinConfig.num_workers)
+    parser.add_argument("--lr_finder", action="store_true")
+    parser.add_argument("--lr_finder_steps", type=int, default=GriffinConfig.lr_finder_steps)
+    parser.add_argument("--lr_finder_start", type=float, default=GriffinConfig.lr_finder_start)
+    parser.add_argument("--lr_finder_end", type=float, default=GriffinConfig.lr_finder_end)
 
     # Runtime
     parser.add_argument("--output_dir", type=str, default=GriffinConfig.output_dir)

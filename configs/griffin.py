@@ -37,6 +37,10 @@ class GriffinConfig:
     grad_accum_steps: int = 8
     max_steps: int = 3000
     lr: float = 3e-4
+    lr_finder: bool = True
+    lr_finder_steps: int = 800
+    lr_finder_start: float = 1e-6
+    lr_finder_end: float = 1
     weight_decay: float = 0.1
     warmup_steps: int = 200
     max_grad_norm: float = 1.0
