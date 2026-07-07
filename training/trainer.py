@@ -326,9 +326,18 @@ def train(cfg: GriffinConfig):
         start_step = int(ckpt.get("step", 0))
         best_val = float(ckpt.get("best_val_loss", float("inf")))
         print(f"[resume] loaded step={start_step} best_val={best_val:.4f}")
+        if ckpt.get("current_val_loss") is not None:
+            print(f"[resume] checkpoint_current_val={float(ckpt['current_val_loss']):.4f}")
         train_skip_chunks = start_step * cfg.batch_size
         train_loader, valid_loader = make_dataloaders(cfg, tokenizer, train_skip_chunks=train_skip_chunks)
         print(f"[resume] skipping {train_skip_chunks:,} training chunks to align the streaming loader")
+        if cfg.eval_on_resume:
+            val_loss, val_ppl = evaluate(model, valid_loader, tokenizer, device, dtype, max_batches=cfg.eval_batches)
+            print(json.dumps({
+                "step": start_step,
+                "resume_val_loss": round(val_loss, 4),
+                "resume_val_ppl": round(val_ppl, 3) if math.isfinite(val_ppl) else "inf",
+            }))
 
     print(f"[model] params={count_parameters(model):,}")
 
@@ -388,10 +397,18 @@ def train(cfg: GriffinConfig):
                 "val_loss": round(val_loss, 4),
                 "val_ppl": round(val_ppl, 3) if math.isfinite(val_ppl) else "inf",
             }))
-            save_checkpoint(outdir / "checkpoint_last.pt", model, optimizer, scheduler, step + 1, cfg, best_val)
-            if val_loss < best_val:
+            improved = val_loss < best_val
+            if improved:
                 best_val = val_loss
-                save_checkpoint(outdir / "checkpoint_best.pt", model, optimizer, scheduler, step + 1, cfg, best_val)
+            save_checkpoint(
+                outdir / "checkpoint_last.pt", model, optimizer, scheduler, step + 1, cfg, best_val,
+                current_val_loss=val_loss,
+            )
+            if improved:
+                save_checkpoint(
+                    outdir / "checkpoint_best.pt", model, optimizer, scheduler, step + 1, cfg, best_val,
+                    current_val_loss=val_loss,
+                )
                 print(f"[checkpoint] new best checkpoint_best.pt @ step={step+1} val_loss={val_loss:.4f}")
             if device.type == "mps":
                 torch.mps.empty_cache()

@@ -54,6 +54,7 @@ class GriffinConfig:
     # Checkpoint / runtime
     output_dir: str = "runs/griffin_tinystories_small"
     resume: Optional[str] = None
+    eval_on_resume: bool = False
     device: str = "auto"  # auto|cpu|mps|cuda
     dtype: str = "float32"  # float32|float16|bfloat16
     compile: bool = False

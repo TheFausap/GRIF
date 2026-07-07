@@ -50,7 +50,7 @@ def count_parameters(model: nn.Module) -> int:
 def save_json(path: Path, data: dict):
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-def save_checkpoint(path: Path, model, optimizer, scheduler, step, cfg: GriffinConfig, best_val_loss=None):
+def save_checkpoint(path: Path, model, optimizer, scheduler, step, cfg: GriffinConfig, best_val_loss=None, current_val_loss=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "model": model.state_dict(),
@@ -59,6 +59,7 @@ def save_checkpoint(path: Path, model, optimizer, scheduler, step, cfg: GriffinC
         "step": step,
         "config": asdict(cfg),
         "best_val_loss": best_val_loss,
+        "current_val_loss": current_val_loss,
     }
     torch.save(payload, path)
 
@@ -123,6 +124,7 @@ def parse_args():
     # Runtime
     parser.add_argument("--output_dir", type=str, default=GriffinConfig.output_dir)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--eval_on_resume", action="store_true")
     parser.add_argument("--device", type=str, default=GriffinConfig.device)
     parser.add_argument("--dtype", type=str, choices=["float32", "float16", "bfloat16"], default=GriffinConfig.dtype)
     parser.add_argument("--compile", action="store_true")
