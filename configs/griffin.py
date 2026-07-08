@@ -39,6 +39,7 @@ class GriffinConfig:
     max_steps: int = 3000
     max_tokens: Optional[int] = None
     lr: float = 3e-4
+    min_lr_ratio: float = 0.0
     lr_finder: bool = True
     lr_finder_steps: int = 800
     lr_finder_start: float = 1e-6

@@ -109,6 +109,7 @@ def parse_args():
     parser.add_argument("--max_steps", type=int, default=GriffinConfig.max_steps)
     parser.add_argument("--max_tokens", type=int, default=None)
     parser.add_argument("--lr", type=float, default=GriffinConfig.lr)
+    parser.add_argument("--min_lr_ratio", type=float, default=GriffinConfig.min_lr_ratio)
     parser.add_argument("--weight_decay", type=float, default=GriffinConfig.weight_decay)
     parser.add_argument("--warmup_steps", type=int, default=GriffinConfig.warmup_steps)
     parser.add_argument("--max_grad_norm", type=float, default=GriffinConfig.max_grad_norm)

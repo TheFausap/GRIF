@@ -58,6 +58,11 @@ def resolve_max_steps_from_tokens(cfg: GriffinConfig):
     cfg.max_steps = math.ceil(cfg.max_tokens / tokens_per_micro_step)
 
 
+def validate_training_config(cfg: GriffinConfig):
+    if not 0.0 <= cfg.min_lr_ratio <= 1.0:
+        raise ValueError("min_lr_ratio must be between 0.0 and 1.0")
+
+
 def planned_train_tokens(cfg: GriffinConfig):
     return cfg.max_steps * cfg.batch_size * cfg.seq_len
 
@@ -68,13 +73,15 @@ def tokens_at_step(cfg: GriffinConfig, step: int):
 
 def build_lr_scheduler(optimizer, cfg: GriffinConfig):
     total_steps = total_optimizer_steps(cfg)
+    min_lr_ratio = cfg.min_lr_ratio
 
     def lr_lambda(step):
         if step < cfg.warmup_steps:
             return float(step + 1) / float(max(1, cfg.warmup_steps))
         progress = (step - cfg.warmup_steps) / float(max(1, total_steps - cfg.warmup_steps))
         progress = min(max(progress, 0.0), 1.0)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
@@ -251,7 +258,7 @@ def evaluate(model, loader, tokenizer: SimpleTokenizer, device, dtype, max_batch
             with maybe_autocast(device, dtype):
                 _, loss = model(x, y)
             losses.append(loss.item())
-        sample = generate_text(model, tokenizer, "The future of AI ", device)
+        sample = generate_text(model, tokenizer, "The future of the mankind is ", device)
         print("\n[SAMPLE]\n", sample[:200], "\n")
     model.train()
     mean_loss = float(sum(losses) / max(1, len(losses)))
@@ -298,6 +305,7 @@ def maybe_train_tokenizer(cfg: GriffinConfig) -> SimpleTokenizer:
 def train(cfg: GriffinConfig):
     set_seed(cfg.seed)
     resolve_max_steps_from_tokens(cfg)
+    validate_training_config(cfg)
     outdir = Path(cfg.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
     save_json(outdir / "config.json", asdict(cfg))
@@ -313,6 +321,8 @@ def train(cfg: GriffinConfig):
         f"planned_tokens={planned_train_tokens(cfg):,}, "
         f"optimizer_updates={total_optimizer_steps(cfg):,}"
     )
+    if cfg.min_lr_ratio > 0:
+        print(f"[lr] min_lr_ratio={cfg.min_lr_ratio:g} min_lr={cfg.lr * cfg.min_lr_ratio:.3e}")
     if cfg.max_tokens is not None and planned_train_tokens(cfg) != cfg.max_tokens:
         print(f"[train] max_tokens={cfg.max_tokens:,} rounded up to {planned_train_tokens(cfg):,} tokens")
 
