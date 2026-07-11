@@ -5,13 +5,20 @@
 
 import copy
 from dataclasses import asdict
+from itertools import islice
 import json
 import math
 from pathlib import Path
 import time
 
 from configs.griffin import GriffinConfig
-from data.dataset import StreamingTokenChunkDataset, iter_dataset_texts, resolve_valid_split
+from data.dataset import (
+    StreamingTokenChunkDataset,
+    iter_dataset_texts,
+    iter_mixed_dataset_texts,
+    parse_dataset_mix,
+    resolve_valid_split,
+)
 from inference.generation import generate_text
 from models.griffin_lm import GriffinLM
 from tokenization.tokeniz import SimpleTokenizer, load_tokenizer, train_bpe_tokenizer
@@ -61,6 +68,7 @@ def resolve_max_steps_from_tokens(cfg: GriffinConfig):
 def validate_training_config(cfg: GriffinConfig):
     if not 0.0 <= cfg.min_lr_ratio <= 1.0:
         raise ValueError("min_lr_ratio must be between 0.0 and 1.0")
+    parse_dataset_mix(cfg.dataset, cfg.dataset_weights)
 
 
 def planned_train_tokens(cfg: GriffinConfig):
@@ -246,7 +254,7 @@ def plot_lr_finder(lrs, losses, save_path="lr_finder.png"):
 # Train / eval / generate
 # -----------------------------
 
-def evaluate(model, loader, tokenizer: SimpleTokenizer, device, dtype, max_batches: int = 40):
+def evaluate(model, loader, tokenizer: SimpleTokenizer, device, dtype, max_batches: int = 40, show_sample: bool = True):
     model.eval()
     losses = []
     with torch.no_grad():
@@ -258,8 +266,9 @@ def evaluate(model, loader, tokenizer: SimpleTokenizer, device, dtype, max_batch
             with maybe_autocast(device, dtype):
                 _, loss = model(x, y)
             losses.append(loss.item())
-        sample = generate_text(model, tokenizer, "The future of the mankind is ", device)
-        print("\n[SAMPLE]\n", sample[:200], "\n")
+        if show_sample:
+            sample = generate_text(model, tokenizer, "The future of the mankind is ", device)
+            print("\n[SAMPLE]\n", sample[:200], "\n")
     model.train()
     mean_loss = float(sum(losses) / max(1, len(losses)))
     ppl = math.exp(mean_loss) if mean_loss < 20 else float("inf")
@@ -270,18 +279,38 @@ def evaluate(model, loader, tokenizer: SimpleTokenizer, device, dtype, max_batch
     }
     return mean_loss, ppl, stats
 
+
+def evaluate_datasets(model, loaders, tokenizer, device, dtype, weights, max_batches):
+    results = {}
+    for index, (name, loader) in enumerate(loaders.items()):
+        loss, ppl, stats = evaluate(
+            model, loader, tokenizer, device, dtype, max_batches=max_batches,
+            show_sample=index == 0,
+        )
+        results[name] = {"loss": loss, "ppl": ppl, **stats}
+    aggregate_loss = sum(weights[name] * result["loss"] for name, result in results.items())
+    aggregate_ppl = math.exp(aggregate_loss) if aggregate_loss < 20 else float("inf")
+    return aggregate_loss, aggregate_ppl, results
+
 def make_dataloaders(cfg: GriffinConfig, tokenizer: SimpleTokenizer, train_skip_chunks: int = 0):
+    dataset_names, dataset_weights = parse_dataset_mix(cfg.dataset, cfg.dataset_weights)
     train_ds = StreamingTokenChunkDataset(
         cfg.dataset, cfg.train_split, tokenizer, cfg.seq_len, cfg.text_field, cfg.streaming,
         skip_chunks=train_skip_chunks, shuffle_buffer=cfg.shuffle_buffer, seed=cfg.seed,
-    )
-    valid_split = resolve_valid_split(cfg.dataset, cfg.valid_split)
-    valid_ds = StreamingTokenChunkDataset(
-        cfg.dataset, valid_split, tokenizer, cfg.seq_len, cfg.text_field, cfg.streaming, max_docs=2048
+        dataset_weights=cfg.dataset_weights,
     )
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, num_workers=cfg.num_workers)
-    valid_loader = DataLoader(valid_ds, batch_size=cfg.batch_size, num_workers=cfg.num_workers)
-    return train_loader, valid_loader
+    valid_loaders = {}
+    for name in dataset_names:
+        valid_split = resolve_valid_split(name, cfg.valid_split)
+        valid_ds = StreamingTokenChunkDataset(
+            name, valid_split, tokenizer, cfg.seq_len, cfg.text_field, cfg.streaming, max_docs=2048
+        )
+        valid_loaders[name] = DataLoader(
+            valid_ds, batch_size=cfg.batch_size, num_workers=cfg.num_workers
+        )
+    weights_by_name = dict(zip(dataset_names, dataset_weights))
+    return train_loader, valid_loaders, weights_by_name
 
 def maybe_train_tokenizer(cfg: GriffinConfig) -> SimpleTokenizer:
     tok_path = Path(cfg.tokenizer_path)
@@ -290,9 +319,18 @@ def maybe_train_tokenizer(cfg: GriffinConfig) -> SimpleTokenizer:
         return load_tokenizer(str(tok_path))
 
     print(f"[tokenizer] training BPE tokenizer -> {tok_path}")
-    text_iter = iter_dataset_texts(
-        cfg.dataset, cfg.train_split, cfg.text_field, cfg.streaming, limit=cfg.tokenizer_train_docs
-    )
+    dataset_names, dataset_weights = parse_dataset_mix(cfg.dataset, cfg.dataset_weights)
+    if len(dataset_names) == 1:
+        text_iter = iter_dataset_texts(
+            dataset_names[0], cfg.train_split, cfg.text_field, cfg.streaming,
+            limit=cfg.tokenizer_train_docs,
+        )
+    else:
+        text_iter = iter_mixed_dataset_texts(
+            dataset_names, dataset_weights, cfg.train_split, cfg.text_field,
+            cfg.streaming, cfg.shuffle_buffer, cfg.seed,
+        )
+        text_iter = islice(text_iter, cfg.tokenizer_train_docs)
     tok = train_bpe_tokenizer(
         text_iter=text_iter,
         tokenizer_path=str(tok_path),
@@ -330,7 +368,8 @@ def train(cfg: GriffinConfig):
     cfg.vocab_size = len(tokenizer.vocab)  # align model vocab with trained tokenizer
     save_json(outdir / "resolved_config.json", asdict(cfg))
 
-    train_loader, valid_loader = make_dataloaders(cfg, tokenizer)
+    train_loader, valid_loaders, validation_weights = make_dataloaders(cfg, tokenizer)
+    print(f"[data] mixture={dict(zip(*parse_dataset_mix(cfg.dataset, cfg.dataset_weights)))}")
     if cfg.shuffle_buffer > 0:
         print(f"[data] train stream shuffle_buffer={cfg.shuffle_buffer:,} seed={cfg.seed}")
     else:
@@ -383,10 +422,14 @@ def train(cfg: GriffinConfig):
             print(f"[checkpoint] current_val={float(ckpt['current_val_loss']):.4f}")
         if not cfg.finetune_reset:
             train_skip_chunks = start_step * cfg.batch_size
-            train_loader, valid_loader = make_dataloaders(cfg, tokenizer, train_skip_chunks=train_skip_chunks)
+            train_loader, valid_loaders, validation_weights = make_dataloaders(
+                cfg, tokenizer, train_skip_chunks=train_skip_chunks
+            )
             print(f"[resume] advancing training stream by {train_skip_chunks:,} chunks")
         if cfg.eval_on_resume:
-            val_loss, val_ppl, val_stats = evaluate(model, valid_loader, tokenizer, device, dtype, max_batches=cfg.eval_batches)
+            val_loss, val_ppl, validation_results = evaluate_datasets(
+                model, valid_loaders, tokenizer, device, dtype, validation_weights, cfg.eval_batches
+            )
             if cfg.finetune_reset:
                 best_val = val_loss
             print(json.dumps({
@@ -394,9 +437,14 @@ def train(cfg: GriffinConfig):
                 "tokens": tokens_at_step(cfg, start_step),
                 "resume_val_loss": round(val_loss, 4),
                 "resume_val_ppl": round(val_ppl, 3) if math.isfinite(val_ppl) else "inf",
-                "val_loss_min": round(val_stats["val_loss_min"], 4),
-                "val_loss_max": round(val_stats["val_loss_max"], 4),
-                "val_batches": val_stats["val_batches"],
+                "validation": {
+                    name: {
+                        "loss": round(result["loss"], 4),
+                        "ppl": round(result["ppl"], 3) if math.isfinite(result["ppl"]) else "inf",
+                        "batches": result["val_batches"],
+                    }
+                    for name, result in validation_results.items()
+                },
             }))
 
     print(f"[model] params={count_parameters(model):,}")
@@ -464,15 +512,22 @@ def train(cfg: GriffinConfig):
             t0 = time.time()
 
         if (step + 1) % cfg.eval_interval == 0:
-            val_loss, val_ppl, val_stats = evaluate(model, valid_loader, tokenizer, device, dtype, max_batches=cfg.eval_batches)
+            val_loss, val_ppl, validation_results = evaluate_datasets(
+                model, valid_loaders, tokenizer, device, dtype, validation_weights, cfg.eval_batches
+            )
             print(json.dumps({
                 "step": step + 1,
                 "tokens": tokens_at_step(cfg, step + 1),
                 "val_loss": round(val_loss, 4),
                 "val_ppl": round(val_ppl, 3) if math.isfinite(val_ppl) else "inf",
-                "val_loss_min": round(val_stats["val_loss_min"], 4),
-                "val_loss_max": round(val_stats["val_loss_max"], 4),
-                "val_batches": val_stats["val_batches"],
+                "validation": {
+                    name: {
+                        "loss": round(result["loss"], 4),
+                        "ppl": round(result["ppl"], 3) if math.isfinite(result["ppl"]) else "inf",
+                        "batches": result["val_batches"],
+                    }
+                    for name, result in validation_results.items()
+                },
             }))
             improved = val_loss < best_val
             if improved:

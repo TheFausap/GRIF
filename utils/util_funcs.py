@@ -78,6 +78,10 @@ def parse_args():
 
     # Data/tokenizer
     parser.add_argument("--dataset", type=str, default=GriffinConfig.dataset)
+    parser.add_argument(
+        "--dataset_weights", type=str, default=None,
+        help="Comma-separated sampling weights matching comma-separated --dataset names",
+    )
     parser.add_argument("--train_split", type=str, default=GriffinConfig.train_split)
     parser.add_argument("--valid_split", type=str, default=GriffinConfig.valid_split)
     parser.add_argument("--text_field", type=str, default=GriffinConfig.text_field)

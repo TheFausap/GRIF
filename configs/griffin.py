@@ -6,6 +6,7 @@ import argparse
 class GriffinConfig:
     # Data
     dataset: str = "roneneldan/TinyStories"  # or emozilla/pg19
+    dataset_weights: Optional[str] = None  # comma-separated; dataset may also be comma-separated
     train_split: str = "train"
     valid_split: str = "validation"
     text_field: str = "text"
