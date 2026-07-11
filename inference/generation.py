@@ -1,4 +1,5 @@
 # inference/generation.py
+from dataclasses import fields
 from pathlib import Path
 
 import torch
@@ -20,7 +21,14 @@ def generate_text(model, tokenizer: SimpleTokenizer, prompt: str, device, max_ne
         else:
             x_cond = x
         logits, _ = model(x_cond, labels=None)
-        logits = logits[:, -1, :] / max(temperature, 1e-5)
+        logits = logits[:, -1, :]
+        if temperature == 0:
+            next_id = torch.argmax(logits, dim=-1, keepdim=True)
+            x = torch.cat([x, next_id], dim=1)
+            if next_id.item() == tokenizer.eos_id:
+                break
+            continue
+        logits = logits / temperature
         if top_k is not None and top_k > 0:
             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
             logits[logits < v[:, [-1]]] = -float("inf")
@@ -30,6 +38,43 @@ def generate_text(model, tokenizer: SimpleTokenizer, prompt: str, device, max_ne
         if next_id.item() == tokenizer.eos_id:
             break
     return tokenizer.decode(x[0].tolist())
+
+
+def load_for_inference(checkpoint_path: str, tokenizer_path: str | None = None, device: str = "auto"):
+    """Load a model using the architecture saved inside its training checkpoint."""
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    target_device = get_device(GriffinConfig(device=device))
+    checkpoint = torch.load(checkpoint_path, map_location=target_device, weights_only=False)
+    saved_config = checkpoint.get("config")
+    if not isinstance(saved_config, dict):
+        raise ValueError("Checkpoint has no saved model configuration")
+
+    valid_fields = {field.name for field in fields(GriffinConfig)}
+    cfg = GriffinConfig(**{key: value for key, value in saved_config.items() if key in valid_fields})
+    cfg.device = device
+
+    requested_tokenizer = tokenizer_path or cfg.tokenizer_path
+    candidates = [Path(requested_tokenizer)]
+    if not tokenizer_path:
+        candidates.extend([
+            checkpoint_path.parent / requested_tokenizer,
+            checkpoint_path.parent / "tokenizer.json",
+        ])
+    tokenizer_file = next((path for path in candidates if path.is_file()), None)
+    if tokenizer_file is None:
+        raise FileNotFoundError(
+            f"Tokenizer not found: {requested_tokenizer}. Pass its path with --tokenizer."
+        )
+
+    tokenizer = load_tokenizer(str(tokenizer_file))
+    cfg.vocab_size = len(tokenizer.vocab)
+    model = GriffinLM(cfg).to(target_device)
+    model.load_state_dict(checkpoint["model"])
+    model.eval()
+    return model, tokenizer, target_device
 
 
 def generate(cfg: GriffinConfig):
